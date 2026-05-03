@@ -24,8 +24,32 @@ Design:
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
+
+
+def _optional_normalized_places_path() -> Path | None:
+    """Locate ``trails/normalized_places.json`` regardless of repo nesting depth.
+
+    Railway/Docker often uses a flat ``/app`` tree (only three parents from root),
+    so a fixed ``parents[3]`` path raises ``IndexError``. Resolution order:
+
+    1. ``NORMALIZED_PLACES_JSON`` — absolute or relative path to the JSON file.
+    2. Walk upward from this package; use the first existing
+       ``<dir>/trails/normalized_places.json`` (covers monorepo and flat layouts).
+    """
+    env = (os.environ.get("NORMALIZED_PLACES_JSON") or "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        return p if p.is_file() else None
+
+    here = Path(__file__).resolve().parent
+    for ancestor in [here, *here.parents]:
+        candidate = ancestor / "trails" / "normalized_places.json"
+        if candidate.is_file():
+            return candidate
+    return None
 
 # (canonical English, aliases). Aliases include Sinhala script, common romanized
 # Sinhala forms, Tamil names, and well-known English synonyms. Keep the
@@ -160,10 +184,8 @@ def _build_index() -> dict[str, str]:
         for al in aliases:
             add(al, canonical)
 
-    excel_json = (
-        Path(__file__).resolve().parents[3] / "trails" / "normalized_places.json"
-    )
-    if excel_json.exists():
+    excel_json = _optional_normalized_places_path()
+    if excel_json is not None:
         try:
             data = json.loads(excel_json.read_text(encoding="utf-8"))
             for row in data:
