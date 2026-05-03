@@ -527,6 +527,10 @@ ORDER BY s.departure
 LIMIT 5
 """
 
+# Full LLM context as a partial variable so braces in JSON/Cypher examples are not
+# parsed as f-string placeholders (ChatPromptTemplate defaults to f-string format).
+_CYPHER_LLM_STATIC = _CYPHER_SYSTEM_PROMPT + "\n" + _CYPHER_FEW_SHOT
+
 
 def _llm_cypher_for_shape(state: SmartMoveState, shape: str) -> str:
     """Ask the LLM for a single-shape Cypher query, falling back to the deterministic builder."""
@@ -556,11 +560,12 @@ def _llm_cypher_for_shape(state: SmartMoveState, shape: str) -> str:
         "query_shape": shape,
     }
 
-    prompt = ChatPromptTemplate.from_messages(
+    prompt = ChatPromptTemplate(
         [
-            ("system", _CYPHER_SYSTEM_PROMPT + "\n" + _CYPHER_FEW_SHOT),
+            ("system", "{static_block}"),
             ("human", "inputs:\n{inputs_json}\noutput:"),
-        ]
+        ],
+        partial_variables={"static_block": _CYPHER_LLM_STATIC},
     )
     try:
         response = (prompt | get_llm()).invoke(

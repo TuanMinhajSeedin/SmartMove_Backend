@@ -16,7 +16,7 @@ GET  /api/neo4j/ping   -> live Neo4j Aura connectivity test.
 
 Environment
 -----------
-The `agents` package autoloads `.env` from the repo root on import. Required keys:
+The `agents` package autoloads `.env` on import (typically next to `main.py`, or one/two dirs up). Required keys:
   - OPENAI_API_KEY
   - NEO4J_URI         (e.g. neo4j+s://<id>.databases.neo4j.io)
   - NEO4J_USER        (defaults to "neo4j" — fine for Aura)
@@ -53,8 +53,22 @@ from agents import (
 )
 
 BACKEND_DIR = Path(__file__).resolve().parent
-REPO_ROOT = BACKEND_DIR.parents[1]
-ENV_PATH = REPO_ROOT / ".env"
+
+
+def _resolve_dotenv_path() -> Path:
+    """Where `.env` lives for this deployment (same walk as `agents._autoload_env`, from `main.py` dir)."""
+    here = BACKEND_DIR
+    for env_path in (
+        here / ".env",
+        here.parent / ".env",
+        here.parent.parent / ".env",
+    ):
+        if env_path.exists():
+            return env_path
+    return here / ".env"
+
+
+ENV_PATH = _resolve_dotenv_path()
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
