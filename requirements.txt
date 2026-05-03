@@ -1,0 +1,9 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+python-dotenv>=1.0.0
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-openai>=1.1.11
+langchain-community>=0.3.0
+neo4j>=5.20.0
