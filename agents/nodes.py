@@ -414,6 +414,7 @@ B. BROWSE shape (rows contain MULTIPLE genuinely-distinct facts):
 FARE PREFERENCE — fare_intent.mode = `{fare_mode}`:
 - "cheapest" -> Always cite fare per option. Call out the top row as the cheapest.
 - "budget"   -> Always cite fare per option. Flag the cheapest in-budget pick.
+- "range"    -> User asked for a min–max LKR band; only discuss rows that match the query filter.
 - "any"      -> Cite fare per option, neutrally. Don't editorialise.
 - "skip"     -> NEVER mention price, fare, cost, LKR, or budget anywhere.
 
@@ -785,11 +786,15 @@ def _fallback_response(
 
         if fare_mode != "skip" and row.get("fare") is not None:
             tag = ""
-            if i == 0 and fare_mode in ("cheapest", "budget"):
+            if i == 0 and fare_mode in ("cheapest", "budget", "range"):
                 tag = (
                     " _(cheapest)_"
                     if fare_mode == "cheapest"
-                    else " _(cheapest within budget)_"
+                    else (
+                        " _(cheapest within budget)_"
+                        if fare_mode == "budget"
+                        else " _(best match in your fare range)_"
+                    )
                 )
             sep = " — " if has_schedule else " "
             line += f"{sep}`LKR {row['fare']}`{tag}"

@@ -35,10 +35,45 @@ def _title_case_place(value: str | None) -> str:
 
 
 def _parse_clock_to_24h(text: str) -> str | None:
-    """Parse a clock token (8pm, 8:30 am, 20:00, 8) into HH:MM 24-hour, or None."""
+    """Parse a clock token (8pm, 8:30 am, 20:00, 8, '7 in the morning') into HH:MM."""
     if not text:
         return None
     t = text.strip().lower().replace(".", ":")
+
+    # Spelled-out parts of day (e.g. "after 7 in the morning" -> remainder "7 in the morning").
+    m_morn = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(?:in\s+the\s+)?morning\b", t)
+    if m_morn:
+        h = int(m_morn.group(1))
+        mn = int(m_morn.group(2) or 0)
+        if h == 12:
+            h = 0  # "12 in the morning" ~ midnight
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return f"{h:02d}:{mn:02d}"
+        return None
+
+    m_aft = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(?:in\s+the\s+)?afternoon\b", t)
+    if m_aft:
+        h = int(m_aft.group(1))
+        mn = int(m_aft.group(2) or 0)
+        if h == 12:
+            pass  # noon
+        elif 1 <= h <= 11:
+            h += 12
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return f"{h:02d}:{mn:02d}"
+        return None
+
+    m_eve = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(?:in\s+the\s+)?evening\b", t)
+    if m_eve:
+        h = int(m_eve.group(1))
+        mn = int(m_eve.group(2) or 0)
+        if h == 12:
+            h = 12
+        elif 1 <= h <= 11:
+            h += 12
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return f"{h:02d}:{mn:02d}"
+        return None
 
     m = re.match(r"^(\d{1,2})(?::(\d{1,2}))?\s*(am|pm|a\.m\.|p\.m\.)$", t)
     if m:
@@ -99,6 +134,27 @@ _FARE_BUDGET_RE = re.compile(
     re.IGNORECASE,
 )
 
+_FARE_RANGE_RE = re.compile(
+    r"(?:lkr|rs\.?|rupees?)?\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:-|–|—|to)\s*(?:lkr|rs\.?|rupees?)?\s*(\d+(?:,\d{3})*(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+_FARE_BETWEEN_RE = re.compile(
+    r"between\s*(?:lkr|rs\.?|rupees?)?\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s+and\s+(?:lkr|rs\.?|rupees?)?\s*(\d+(?:,\d{3})*(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_two_money_groups(a: str, b: str) -> tuple[float, float] | None:
+    try:
+        lo = float(a.replace(",", ""))
+        hi = float(b.replace(",", ""))
+    except ValueError:
+        return None
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
 
 def _parse_fare_intent(fare: str | None) -> dict[str, Any]:
     """Classify the fare string into a structured intent.
@@ -108,6 +164,7 @@ def _parse_fare_intent(fare: str | None) -> dict[str, Any]:
         {"mode": "any"}               -> include fare info, no filter, no ordering
         {"mode": "cheapest"}          -> ORDER BY f.fare ASC
         {"mode": "budget", "max": N}  -> WHERE f.fare <= N, ORDER BY f.fare ASC
+        {"mode": "range", "min": A, "max": B} -> WHERE f.fare >= A AND f.fare <= B
     """
     f = (fare or "").strip().lower()
     if not f or f in {"no", "false", "0", "skip", "none"}:
@@ -115,6 +172,20 @@ def _parse_fare_intent(fare: str | None) -> dict[str, Any]:
 
     if "cheap" in f or "lowest" in f or "economy" in f:
         return {"mode": "cheapest"}
+
+    m_bt = _FARE_BETWEEN_RE.search(f)
+    if m_bt:
+        pair = _parse_two_money_groups(m_bt.group(1), m_bt.group(2))
+        if pair:
+            lo, hi = pair
+            return {"mode": "range", "min": lo, "max": hi}
+
+    m_rn = _FARE_RANGE_RE.search(f)
+    if m_rn:
+        pair = _parse_two_money_groups(m_rn.group(1), m_rn.group(2))
+        if pair:
+            lo, hi = pair
+            return {"mode": "range", "min": lo, "max": hi}
 
     m = _FARE_BUDGET_RE.search(f)
     if m:
@@ -232,6 +303,115 @@ def _strip_cypher_fence(content: str) -> str:
     return text
 
 
+def _norm_cypher(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").lower())
+
+
+def _numeric_literal_in_cypher(cy: str, n: Any) -> bool:
+    """Loose check that an LKR amount appears (handles 500 / 500.0 / 500.00)."""
+    if n is None:
+        return False
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return False
+    candidates = {str(int(v))}
+    if v != int(v):
+        candidates.add(str(v))
+    candidates.add(f"{v:g}")
+    return any(c in cy for c in candidates)
+
+
+def _time_literal_in_cypher(cy: str, time_24: str) -> bool:
+    """Accept HH:MM as stored or without a leading zero on the hour."""
+    if not time_24:
+        return True
+    if time_24.lower() in cy:
+        return True
+    m = re.fullmatch(r"0?(\d{1,2}):(\d{2})", time_24.strip())
+    if m:
+        alt = f"{int(m.group(1))}:{m.group(2)}"
+        if alt in cy:
+            return True
+    return False
+
+
+def _llm_cypher_respects_constraints(
+    cypher: str,
+    shape: str,
+    *,
+    op: str | None,
+    time_24: str | None,
+    fare_intent: dict[str, Any],
+    transport: str,
+) -> bool:
+    """Reject LLM output that drops structured filters (common model failure)."""
+    cy = _norm_cypher(cypher)
+    if shape == "fare_only":
+        mode = fare_intent.get("mode")
+        if mode == "budget":
+            mx = fare_intent.get("max")
+            return (
+                "f.fare" in cy
+                and "<=" in cy
+                and mx is not None
+                and _numeric_literal_in_cypher(cy, mx)
+            )
+        if mode == "range":
+            lo, hi = fare_intent.get("min"), fare_intent.get("max")
+            if lo is None or hi is None:
+                return False
+            return (
+                "f.fare" in cy
+                and ">=" in cy
+                and "<=" in cy
+                and _numeric_literal_in_cypher(cy, lo)
+                and _numeric_literal_in_cypher(cy, hi)
+            )
+        return True
+
+    need_sched_time = shape in ("both", "schedule_only") and bool(op and time_24)
+    if need_sched_time:
+        if "s.departure" not in cy:
+            return False
+        if not _time_literal_in_cypher(cy, time_24 or ""):
+            return False
+        sym = {">=": ">=", "<=": "<=", "=": "="}.get(op or "", "")
+        if sym and sym not in cy:
+            return False
+
+    need_transport = shape in ("both", "schedule_only") and bool(
+        (transport or "").strip()
+    )
+    if need_transport and "contains" not in cy:
+        return False
+
+    need_fare_where = shape == "both" and fare_intent.get("mode") in (
+        "budget",
+        "range",
+    )
+    if need_fare_where:
+        mode = fare_intent.get("mode")
+        if "f.fare" not in cy:
+            return False
+        if mode == "budget":
+            mx = fare_intent.get("max")
+            return mx is not None and "<=" in cy and _numeric_literal_in_cypher(
+                cy, mx
+            )
+        lo, hi = fare_intent.get("min"), fare_intent.get("max")
+        if lo is None or hi is None:
+            return False
+        return (
+            ">=" in cy
+            and "<=" in cy
+            and _numeric_literal_in_cypher(cy, lo)
+            and _numeric_literal_in_cypher(cy, hi)
+        )
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Deterministic fallback Cypher
 # ---------------------------------------------------------------------------
@@ -249,6 +429,10 @@ def _build_fare_only_cypher(state: SmartMoveState) -> str:
     ]
     if fi["mode"] == "budget":
         lines.append(f"WHERE f.fare <= {fi['max']}")
+    elif fi["mode"] == "range":
+        lines.append(
+            f"WHERE f.fare >= {fi['min']} AND f.fare <= {fi['max']}"
+        )
     lines.append(
         "RETURN from.name AS origin, to.name AS destination, f.fare AS fare"
     )
@@ -336,6 +520,12 @@ def _build_combined_cypher(state: SmartMoveState) -> str:
         lines.append("MATCH (from)-[f:Fare]->(to)")
         if fare_intent["mode"] == "budget":
             lines.append(f"WITH from, to, s, f WHERE f.fare <= {fare_intent['max']}")
+            lines.append("ORDER BY f.fare ASC")
+        elif fare_intent["mode"] == "range":
+            lines.append(
+                "WITH from, to, s, f WHERE "
+                f"f.fare >= {fare_intent['min']} AND f.fare <= {fare_intent['max']}"
+            )
             lines.append("ORDER BY f.fare ASC")
         elif fare_intent["mode"] == "cheapest":
             lines.append("WITH from, to, s, f")
@@ -428,6 +618,7 @@ QUERY SHAPE — `query_shape` is the MOST IMPORTANT input. Pick exactly ONE temp
   shape = "fare_only"     // user is asking ONLY about price/fare/cost.
     MATCH (from:Place {name: "<Origin>"})-[f:Fare]->(to:Place {name: "<Destination>"})
     [WHERE f.fare <= <budget>]                  // only when fare_intent.mode = "budget"
+    [WHERE f.fare >= <min> AND f.fare <= <max>] // only when fare_intent.mode = "range"
     RETURN from.name AS origin, to.name AS destination, f.fare AS fare
     ORDER BY f.fare ASC
     LIMIT 5
@@ -452,8 +643,10 @@ QUERY SHAPE — `query_shape` is the MOST IMPORTANT input. Pick exactly ONE temp
     MATCH (from:Place {name: "<Origin>"})-[s:Schedule]->(to:Place {name: "<Destination>"})
     [WHERE s.departure <op> "<HH:MM>" [AND <transport filter>]]
     [MATCH (from)-[f:Fare]->(to)]                  // when fare_intent.mode != "skip"
-    [WITH from, to, s, f [WHERE f.fare <= <budget>]]
-    [ORDER BY f.fare ASC]                          // when fare_intent.mode in {cheapest, budget}
+    If fare_intent.mode = "budget": WITH ... WHERE f.fare <= max
+    If fare_intent.mode = "range": WITH ... WHERE f.fare >= min AND f.fare <= max
+    If fare_intent.mode in ("cheapest","any"): WITH from, to, s, f (no fare WHERE unless needed)
+    [ORDER BY f.fare ASC]                          // when narrowing by fare (budget / range / cheapest)
     RETURN
       from.name AS origin, to.name AS destination,
       s.departure AS departure_time, s.arrival AS arrival_time
@@ -463,7 +656,8 @@ QUERY SHAPE — `query_shape` is the MOST IMPORTANT input. Pick exactly ONE temp
 NORMALIZATION RULES (already applied for you in `inputs`):
   - Place names are pre-converted to Title Case (Neo4j-stored form).
   - `departure_constraint` is {"op": ">="|"<="|"=", "time": "HH:MM"} or null.
-  - `fare_intent.mode` is one of: "skip" | "any" | "cheapest" | "budget".
+  - `fare_intent.mode` is one of: "skip" | "any" | "cheapest" | "budget" | "range".
+  - When mode is "range", `fare_intent` includes numeric `min` and `max` (LKR).
 
 OUTPUT:
 - Return ONLY the Cypher query (no markdown fences, no commentary, no $params).
@@ -525,6 +719,25 @@ WHERE (toLower(coalesce(s.transport_type, s.service_type, '')) CONTAINS 'bus')
 RETURN from.name AS origin, to.name AS destination, s.departure AS departure_time, s.arrival AS arrival_time, s.route_type AS route_type, s.service_type AS service_type
 ORDER BY s.departure
 LIMIT 5
+
+# 4) Combined: departure after morning time + fare range (LKR)
+inputs:
+{
+  "origin": "Colombo",
+  "destination": "Kandy",
+  "departure_constraint": {"op": ">=", "time": "07:00"},
+  "transport_type": null,
+  "fare_intent": {"mode": "range", "min": 500.0, "max": 800.0},
+  "query_shape": "both"
+}
+output:
+MATCH (from:Place {name: "Colombo"})-[s:Schedule]->(to:Place {name: "Kandy"})
+WHERE s.departure >= "07:00"
+MATCH (from)-[f:Fare]->(to)
+WITH from, to, s, f WHERE f.fare >= 500.0 AND f.fare <= 800.0
+ORDER BY f.fare ASC
+RETURN from.name AS origin, to.name AS destination, s.departure AS departure_time, s.arrival AS arrival_time, f.fare AS fare
+LIMIT 5
 """
 
 # Full LLM context as a partial variable so braces in JSON/Cypher examples are not
@@ -573,6 +786,15 @@ def _llm_cypher_for_shape(state: SmartMoveState, shape: str) -> str:
         ).content
         cypher = _strip_cypher_fence(response)
         if not cypher or "MATCH" not in cypher.upper():
+            cypher = deterministic
+        elif not _llm_cypher_respects_constraints(
+            cypher,
+            shape,
+            op=op,
+            time_24=time_24,
+            fare_intent=fare_intent,
+            transport=(state.get("transport_type") or "").strip().lower(),
+        ):
             cypher = deterministic
     except Exception:
         cypher = deterministic

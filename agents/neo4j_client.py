@@ -16,9 +16,9 @@ def _neo4j_config() -> tuple[str, str, str, str]:
         return raw.strip().strip('"').strip("'")
 
     uri = _v("NEO4J_URI")
-    user = _v("NEO4J_USER", "neo4j") or "neo4j"
+    user = _v("NEO4J_USER", "b8144b99") or "b8144b99"
     password = _v("NEO4J_PASSWORD")
-    database = _v("NEO4J_DATABASE", "neo4j") or "neo4j"
+    database = _v("NEO4J_DATABASE", "b8144b99") or "b8144b99"
     return uri, user, password, database
 
 
