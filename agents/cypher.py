@@ -104,28 +104,124 @@ def _parse_clock_to_24h(text: str) -> str | None:
     return None
 
 
-def _parse_departure_constraint(raw: str | None) -> tuple[str | None, str | None]:
-    """Map a departure_time phrase to (sql-style operator, HH:MM string)."""
+def _period_hint_from_text(text: str) -> str | None:
+    """Infer am/pm from period-of-day words so bare hours inherit context."""
+    t = (text or "").strip().lower()
+    if re.search(r"\b(?:morning|dawn|a\.?m\.?)\b", t):
+        return "am"
+    if re.search(r"\b(?:afternoon|evening|night|noon|dusk|p\.?m\.?)\b", t):
+        return "pm"
+    return None
+
+
+def _parse_clock_side(side: str, period_hint: str | None = None) -> str | None:
+    """Parse one side of a time range, optionally applying a shared am/pm hint."""
+    side = (side or "").strip().lower()
+    if not side:
+        return None
+    direct = _parse_clock_to_24h(side)
+    if direct:
+        return direct
+    if period_hint and not re.search(r"\b(?:am|pm|a\.m\.|p\.m\.|morning|afternoon|evening)\b", side):
+        return _parse_clock_to_24h(f"{side} {period_hint}")
+    return None
+
+
+def _parse_departure_constraint(raw: str | None) -> dict[str, Any] | None:
+    """Map a departure_time phrase to a structured Cypher filter.
+
+    Returns one of:
+      {"op": ">=", "time": "HH:MM"}
+      {"op": "<=", "time": "HH:MM"}
+      {"op": "between", "start": "HH:MM", "end": "HH:MM"}
+      None
+    """
     if not raw:
-        return None, None
+        return None
     s = raw.strip().lower()
 
-    m = re.match(r"^\s*(after|from|>=)\s+(.+)$", s)
+    # "between 8 and 9 in the morning" / "from 8 to 9am" / "between 08:00 and 09:00"
+    m_bt = re.match(
+        r"^\s*(?:between|from)\s+(.+?)\s+(?:and|to)\s+(.+?)\s*$",
+        s,
+    )
+    if m_bt:
+        left, right = m_bt.group(1).strip(), m_bt.group(2).strip()
+        hint = _period_hint_from_text(right) or _period_hint_from_text(left) or _period_hint_from_text(s)
+        start = _parse_clock_side(left, hint)
+        end = _parse_clock_side(right, hint)
+        if start and end:
+            if start > end:
+                start, end = end, start
+            return {"op": "between", "start": start, "end": end}
+
+    # Compact dash form: "8-9am", "8:00-09:00", "8am-9am"
+    m_dash = re.match(
+        r"^\s*(\d{1,2}(?::\d{2})?)\s*(am|pm|a\.m\.|p\.m\.)?\s*[-–—]\s*"
+        r"(\d{1,2}(?::\d{2})?)\s*(am|pm|a\.m\.|p\.m\.|(?:in\s+the\s+)?"
+        r"(?:morning|afternoon|evening))?\s*$",
+        s,
+    )
+    if m_dash:
+        left = m_dash.group(1) + ((" " + m_dash.group(2)) if m_dash.group(2) else "")
+        right = m_dash.group(3) + ((" " + m_dash.group(4)) if m_dash.group(4) else "")
+        hint = _period_hint_from_text(right) or _period_hint_from_text(left) or _period_hint_from_text(s)
+        start = _parse_clock_side(left.strip(), hint)
+        end = _parse_clock_side(right.strip(), hint)
+        if start and end:
+            if start > end:
+                start, end = end, start
+            return {"op": "between", "start": start, "end": end}
+
+    # "after 8am" / "from 8am" (single lower bound — "from X to Y" handled above)
+    m = re.match(r"^\s*(after|>=)\s+(.+)$", s)
     if m:
-        return ">=", _parse_clock_to_24h(m.group(2))
+        t = _parse_clock_to_24h(m.group(2))
+        return {"op": ">=", "time": t} if t else None
+
+    m = re.match(r"^\s*from\s+(.+)$", s)
+    if m:
+        # Bare "from 8am" (no upper bound) — treat as >=
+        t = _parse_clock_to_24h(m.group(1))
+        return {"op": ">=", "time": t} if t else None
 
     m = re.match(r"^\s*(before|until|<=)\s+(.+)$", s)
     if m:
-        return "<=", _parse_clock_to_24h(m.group(2))
+        t = _parse_clock_to_24h(m.group(2))
+        return {"op": "<=", "time": t} if t else None
 
     m = re.match(r"^\s*at\s+(.+)$", s)
     if m:
-        return "=", _parse_clock_to_24h(m.group(1))
+        t = _parse_clock_to_24h(m.group(1))
+        return {"op": ">=", "time": t} if t else None
 
     direct = _parse_clock_to_24h(s)
     if direct:
-        return "=", direct
-    return None, None
+        return {"op": ">=", "time": direct}
+    return None
+
+
+def _departure_where_parts(constraint: dict[str, Any] | None) -> list[str]:
+    """Build `s.departure ...` predicates from a parsed departure constraint."""
+    if not constraint:
+        return []
+    op = constraint.get("op")
+    if op == "between":
+        start, end = constraint.get("start"), constraint.get("end")
+        if start and end:
+            return [f's.departure >= "{start}"', f's.departure <= "{end}"']
+        return []
+    time_24 = constraint.get("time")
+    if op and time_24:
+        return [f's.departure {op} "{time_24}"']
+    return []
+
+
+def _orders_departure_asc(constraint: dict[str, Any] | None) -> bool:
+    """Whether results should be ordered earliest-first for this constraint."""
+    if not constraint:
+        return False
+    return constraint.get("op") in {">", ">=", "between"}
 
 
 _FARE_BUDGET_RE = re.compile(
@@ -251,7 +347,7 @@ _SCHEDULE_INTENT_PATTERNS = [
     r"\bnext\s+(?:bus|train|ferry|flight|service)\b",
     r"\bearliest\b",
     r"\blatest\b",
-    r"\b(?:after|before)\s+\d",
+    r"\b(?:after|before|between)\s+\d",
     r"\b(?:morning|noon|afternoon|evening|night|tonight|midnight|dawn|dusk)\b",
     # Sinhala
     r"වේලාව|වේලාවට|වේලාවන්|වේලාවක්",
@@ -336,17 +432,29 @@ def _time_literal_in_cypher(cy: str, time_24: str) -> bool:
     return False
 
 
+def _uses_disallowed_transport_properties(cypher: str) -> bool:
+    """Reject Cypher that relies on unsupported transport/service properties."""
+    cy = _norm_cypher(cypher)
+    return (
+        "transport_type" in cy
+        or "service_type" in cy
+        or ("coalesce(" in cy and "contains" in cy)
+    )
+
+
 def _llm_cypher_respects_constraints(
     cypher: str,
     shape: str,
     *,
-    op: str | None,
-    time_24: str | None,
+    departure_constraint: dict[str, Any] | None,
     fare_intent: dict[str, Any],
     transport: str,
 ) -> bool:
     """Reject LLM output that drops structured filters (common model failure)."""
     cy = _norm_cypher(cypher)
+    if _uses_disallowed_transport_properties(cypher):
+        return False
+
     if shape == "fare_only":
         mode = fare_intent.get("mode")
         if mode == "budget":
@@ -370,21 +478,30 @@ def _llm_cypher_respects_constraints(
             )
         return True
 
-    need_sched_time = shape in ("both", "schedule_only") and bool(op and time_24)
+    need_sched_time = shape in ("both", "schedule_only") and bool(
+        departure_constraint
+    )
     if need_sched_time:
         if "s.departure" not in cy:
             return False
-        if not _time_literal_in_cypher(cy, time_24 or ""):
-            return False
-        sym = {">=": ">=", "<=": "<=", "=": "="}.get(op or "", "")
-        if sym and sym not in cy:
-            return False
-
-    need_transport = shape in ("both", "schedule_only") and bool(
-        (transport or "").strip()
-    )
-    if need_transport and "contains" not in cy:
-        return False
+        op = (departure_constraint or {}).get("op")
+        if op == "between":
+            start = (departure_constraint or {}).get("start") or ""
+            end = (departure_constraint or {}).get("end") or ""
+            if not (
+                _time_literal_in_cypher(cy, start)
+                and _time_literal_in_cypher(cy, end)
+                and ">=" in cy
+                and "<=" in cy
+            ):
+                return False
+        else:
+            time_24 = (departure_constraint or {}).get("time") or ""
+            if not _time_literal_in_cypher(cy, time_24):
+                return False
+            sym = {">=": ">=", "<=": "<=", "=": "="}.get(op or "", "")
+            if sym and sym not in cy:
+                return False
 
     need_fare_where = shape == "both" and fare_intent.get("mode") in (
         "budget",
@@ -434,10 +551,10 @@ def _build_fare_only_cypher(state: SmartMoveState) -> str:
             f"WHERE f.fare >= {fi['min']} AND f.fare <= {fi['max']}"
         )
     lines.append(
-        "RETURN from.name AS origin, to.name AS destination, f.fare AS fare"
+        "RETURN from.name AS origin, to.name AS destination, "
+        "f { .fare, .route_type, .route_key, .service_type, .fare_type } AS fare_properties"
     )
     lines.append("ORDER BY f.fare ASC")
-    lines.append("LIMIT 5")
     return "\n".join(lines)
 
 
@@ -464,28 +581,22 @@ def _build_schedule_only_cypher(state: SmartMoveState) -> str:
     """Standalone Schedule-only query. Reusable as a fallback for "both" shape."""
     origin = _title_case_place(state.get("origin")) or "Unknown"
     destination = _title_case_place(state.get("destination")) or "Unknown"
-    transport = (state.get("transport_type") or "").strip().lower()
-    op, time_24 = _parse_departure_constraint(state.get("departure_time"))
+    dep = _parse_departure_constraint(state.get("departure_time"))
 
     lines: list[str] = [
         f'MATCH (from:Place {{name: "{origin}"}})-[s:Schedule]->(to:Place {{name: "{destination}"}})',
     ]
-    where_parts: list[str] = []
-    if op and time_24:
-        where_parts.append(f's.departure {op} "{time_24}"')
-    if transport:
-        where_parts.append(
-            f"(toLower(coalesce(s.transport_type, s.service_type, '')) CONTAINS '{transport}')"
-        )
+    where_parts = _departure_where_parts(dep)
     if where_parts:
         lines.append("WHERE " + " AND ".join(where_parts))
     lines.append(
         "RETURN from.name AS origin, to.name AS destination, "
-        "s.departure AS departure_time, s.arrival AS arrival_time, "
-        "s.route_type AS route_type, s.service_type AS service_type"
+        "s { .arrival, .departure, .route_type, .service_type, .working_days, .fare_type } AS schedule_properties"
     )
-    lines.append("ORDER BY s.departure")
-    lines.append("LIMIT 5")
+    if _orders_departure_asc(dep):
+        lines.append("ORDER BY s.departure ASC")
+    else:
+        lines.append("ORDER BY s.departure")
     return "\n".join(lines)
 
 
@@ -493,51 +604,46 @@ def _build_combined_cypher(state: SmartMoveState) -> str:
     """Combined Schedule + Fare query (the "both" shape)."""
     origin = _title_case_place(state.get("origin")) or "Unknown"
     destination = _title_case_place(state.get("destination")) or "Unknown"
-    transport = (state.get("transport_type") or "").strip().lower()
-    op, time_24 = _parse_departure_constraint(state.get("departure_time"))
+    dep = _parse_departure_constraint(state.get("departure_time"))
     fare_intent = _parse_fare_intent(state.get("fare"))
 
     lines = [
         f'MATCH (from:Place {{name: "{origin}"}})-[s:Schedule]->(to:Place {{name: "{destination}"}})',
     ]
-    where_parts = []
-    if op and time_24:
-        where_parts.append(f's.departure {op} "{time_24}"')
-    if transport:
-        where_parts.append(
-            f"(toLower(coalesce(s.transport_type, s.service_type, '')) CONTAINS '{transport}')"
-        )
+    where_parts = _departure_where_parts(dep)
     if where_parts:
         lines.append("WHERE " + " AND ".join(where_parts))
 
     return_cols = [
         "from.name AS origin",
         "to.name AS destination",
-        "s.departure AS departure_time",
-        "s.arrival AS arrival_time",
+        "s { .arrival, .departure, .route_type, .service_type, .working_days, .fare_type } AS schedule_properties",
     ]
     if fare_intent["mode"] != "skip":
         lines.append("MATCH (from)-[f:Fare]->(to)")
         if fare_intent["mode"] == "budget":
             lines.append(f"WITH from, to, s, f WHERE f.fare <= {fare_intent['max']}")
-            lines.append("ORDER BY f.fare ASC")
+            lines.append("ORDER BY s.departure ASC")
         elif fare_intent["mode"] == "range":
             lines.append(
                 "WITH from, to, s, f WHERE "
                 f"f.fare >= {fare_intent['min']} AND f.fare <= {fare_intent['max']}"
             )
-            lines.append("ORDER BY f.fare ASC")
+            lines.append("ORDER BY s.departure ASC")
         elif fare_intent["mode"] == "cheapest":
             lines.append("WITH from, to, s, f")
-            lines.append("ORDER BY f.fare ASC")
+            lines.append("ORDER BY s.departure ASC")
         else:
             lines.append("WITH from, to, s, f")
-        return_cols.append("f.fare AS fare")
+            lines.append("ORDER BY s.departure ASC")
+        return_cols.append("f { .fare, .route_type, .route_key, .service_type, .fare_type } AS fare_properties")
     else:
-        lines.append("ORDER BY s.departure")
+        if _orders_departure_asc(dep):
+            lines.append("ORDER BY s.departure ASC")
+        else:
+            lines.append("ORDER BY s.departure")
 
     lines.append("RETURN " + ", ".join(return_cols))
-    lines.append("LIMIT 5")
     return "\n".join(lines)
 
 
@@ -621,7 +727,6 @@ QUERY SHAPE — `query_shape` is the MOST IMPORTANT input. Pick exactly ONE temp
     [WHERE f.fare >= <min> AND f.fare <= <max>] // only when fare_intent.mode = "range"
     RETURN from.name AS origin, to.name AS destination, f.fare AS fare
     ORDER BY f.fare ASC
-    LIMIT 5
     RULES:
       - DO NOT MATCH :Schedule.
       - DO NOT include departure / arrival / route_type / service_type in RETURN.
@@ -630,18 +735,20 @@ QUERY SHAPE — `query_shape` is the MOST IMPORTANT input. Pick exactly ONE temp
 
   shape = "schedule_only" // user is asking ONLY about times / next service.
     MATCH (from:Place {name: "<Origin>"})-[s:Schedule]->(to:Place {name: "<Destination>"})
-    [WHERE s.departure <op> "<HH:MM>" [AND <transport filter>]]
+    [WHERE s.departure <op> "<HH:MM>"]
+    [WHERE s.departure >= "<start>" AND s.departure <= "<end>"]  // when departure_constraint.op = "between"
     RETURN from.name AS origin, to.name AS destination,
            s.departure AS departure_time, s.arrival AS arrival_time,
            s.route_type AS route_type, s.service_type AS service_type
-    ORDER BY s.departure
-    LIMIT 5
+    ORDER BY s.departure ASC
     RULES:
       - DO NOT MATCH :Fare. DO NOT include f.fare in RETURN even if fare_intent says so.
+      - When departure_constraint.op = "between", ALWAYS use both >= start AND <= end.
 
   shape = "both"          // combined route+fare lookup (default).
     MATCH (from:Place {name: "<Origin>"})-[s:Schedule]->(to:Place {name: "<Destination>"})
-    [WHERE s.departure <op> "<HH:MM>" [AND <transport filter>]]
+    [WHERE s.departure <op> "<HH:MM>"]
+    [WHERE s.departure >= "<start>" AND s.departure <= "<end>"]  // when departure_constraint.op = "between"
     [MATCH (from)-[f:Fare]->(to)]                  // when fare_intent.mode != "skip"
     If fare_intent.mode = "budget": WITH ... WHERE f.fare <= max
     If fare_intent.mode = "range": WITH ... WHERE f.fare >= min AND f.fare <= max
@@ -651,18 +758,20 @@ QUERY SHAPE — `query_shape` is the MOST IMPORTANT input. Pick exactly ONE temp
       from.name AS origin, to.name AS destination,
       s.departure AS departure_time, s.arrival AS arrival_time
       [, f.fare AS fare]                           // only when fare is matched
-    LIMIT 5
 
 NORMALIZATION RULES (already applied for you in `inputs`):
   - Place names are pre-converted to Title Case (Neo4j-stored form).
-  - `departure_constraint` is {"op": ">="|"<="|"=", "time": "HH:MM"} or null.
+  - `departure_constraint` is one of:
+      {"op": ">="|"<="|"=", "time": "HH:MM"}
+      {"op": "between", "start": "HH:MM", "end": "HH:MM"}
+      null
   - `fare_intent.mode` is one of: "skip" | "any" | "cheapest" | "budget" | "range".
   - When mode is "range", `fare_intent` includes numeric `min` and `max` (LKR).
 
 OUTPUT:
 - Return ONLY the Cypher query (no markdown fences, no commentary, no $params).
 - Single-line clauses separated by newlines.
-- Always end with `LIMIT 5`.
+- Do not include a LIMIT clause.
 """
 
 
@@ -683,9 +792,8 @@ MATCH (from:Place {name: "Colombo"})-[s:Schedule]->(to:Place {name: "Kandy"})
 WHERE s.departure >= "20:00"
 MATCH (from)-[f:Fare]->(to)
 WITH from, to, s, f
-ORDER BY f.fare ASC
+ORDER BY s.departure ASC
 RETURN from.name AS origin, to.name AS destination, s.departure AS departure_time, s.arrival AS arrival_time, f.fare AS fare
-LIMIT 5
 
 # 2) Fare-only lookup ("what are the fares from Anuradhapura to Colombo?")
 inputs:
@@ -701,7 +809,6 @@ output:
 MATCH (from:Place {name: "Anuradhapura"})-[f:Fare]->(to:Place {name: "Colombo"})
 RETURN from.name AS origin, to.name AS destination, f.fare AS fare
 ORDER BY f.fare ASC
-LIMIT 5
 
 # 3) Schedule-only lookup ("when is the next bus from Galle to Matara?")
 inputs:
@@ -715,10 +822,8 @@ inputs:
 }
 output:
 MATCH (from:Place {name: "Galle"})-[s:Schedule]->(to:Place {name: "Matara"})
-WHERE (toLower(coalesce(s.transport_type, s.service_type, '')) CONTAINS 'bus')
 RETURN from.name AS origin, to.name AS destination, s.departure AS departure_time, s.arrival AS arrival_time, s.route_type AS route_type, s.service_type AS service_type
 ORDER BY s.departure
-LIMIT 5
 
 # 4) Combined: departure after morning time + fare range (LKR)
 inputs:
@@ -735,9 +840,24 @@ MATCH (from:Place {name: "Colombo"})-[s:Schedule]->(to:Place {name: "Kandy"})
 WHERE s.departure >= "07:00"
 MATCH (from)-[f:Fare]->(to)
 WITH from, to, s, f WHERE f.fare >= 500.0 AND f.fare <= 800.0
-ORDER BY f.fare ASC
+ORDER BY s.departure ASC
 RETURN from.name AS origin, to.name AS destination, s.departure AS departure_time, s.arrival AS arrival_time, f.fare AS fare
-LIMIT 5
+
+# 5) Schedule-only time window ("between 8 and 9 in the morning")
+inputs:
+{
+  "origin": "Colombo",
+  "destination": "Kandy",
+  "departure_constraint": {"op": "between", "start": "08:00", "end": "09:00"},
+  "transport_type": null,
+  "fare_intent": {"mode": "skip"},
+  "query_shape": "schedule_only"
+}
+output:
+MATCH (from:Place {name: "Colombo"})-[s:Schedule]->(to:Place {name: "Kandy"})
+WHERE s.departure >= "08:00" AND s.departure <= "09:00"
+RETURN from.name AS origin, to.name AS destination, s.departure AS departure_time, s.arrival AS arrival_time, s.route_type AS route_type, s.service_type AS service_type
+ORDER BY s.departure ASC
 """
 
 # Full LLM context as a partial variable so braces in JSON/Cypher examples are not
@@ -747,10 +867,10 @@ _CYPHER_LLM_STATIC = _CYPHER_SYSTEM_PROMPT + "\n" + _CYPHER_FEW_SHOT
 
 def _llm_cypher_for_shape(state: SmartMoveState, shape: str) -> str:
     """Ask the LLM for a single-shape Cypher query, falling back to the deterministic builder."""
-    op, time_24 = _parse_departure_constraint(state.get("departure_time"))
+    departure_constraint = _parse_departure_constraint(state.get("departure_time"))
     fare_intent = _parse_fare_intent(state.get("fare"))
     if shape == "fare_only":
-        op, time_24 = None, None
+        departure_constraint = None
 
     if shape == "fare_only":
         deterministic = _build_fare_only_cypher(state)
@@ -765,9 +885,7 @@ def _llm_cypher_for_shape(state: SmartMoveState, shape: str) -> str:
     inputs: dict[str, Any] = {
         "origin": _title_case_place(state.get("origin")) or None,
         "destination": _title_case_place(state.get("destination")) or None,
-        "departure_constraint": (
-            {"op": op, "time": time_24} if op and time_24 else None
-        ),
+        "departure_constraint": departure_constraint,
         "transport_type": state.get("transport_type"),
         "fare_intent": fare_intent,
         "query_shape": shape,
@@ -790,8 +908,7 @@ def _llm_cypher_for_shape(state: SmartMoveState, shape: str) -> str:
         elif not _llm_cypher_respects_constraints(
             cypher,
             shape,
-            op=op,
-            time_24=time_24,
+            departure_constraint=departure_constraint,
             fare_intent=fare_intent,
             transport=(state.get("transport_type") or "").strip().lower(),
         ):

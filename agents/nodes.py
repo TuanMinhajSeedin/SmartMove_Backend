@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -318,10 +319,6 @@ def neo4j_query_node(state: SmartMoveState) -> SmartMoveState:
         "fare_reversed": False,
     }
 
-    if _is_usable(primary_result):
-        out["result_source"] = "combined"
-        return out
-
     has_combined_fallback = bool(schedule_q or fare_q)
 
     # ---- "both" shape: run schedule + fare separately, with fare-reverse retry ----
@@ -336,6 +333,10 @@ def neo4j_query_node(state: SmartMoveState) -> SmartMoveState:
         out["result_schedule"] = sched_res
         out["result_fare"] = fare_res
 
+        if _is_usable(primary_result):
+            out["result_source"] = "combined"
+            return out
+
         if _is_usable(sched_res) or _is_usable(fare_res):
             out["result_source"] = "split"
         else:
@@ -345,6 +346,10 @@ def neo4j_query_node(state: SmartMoveState) -> SmartMoveState:
                     out["result"] = cand
                     break
             out["result_source"] = "primary_error"
+        return out
+
+    if _is_usable(primary_result):
+        out["result_source"] = "combined"
         return out
 
     # ---- pure fare-only shape: try the reversed fare ----
@@ -404,8 +409,11 @@ A. SINGLE-FACT shape (rows collapse to ONE distinct fact, OR user asked
    - NO bullet list. NO repetition.
 B. BROWSE shape (rows contain MULTIPLE genuinely-distinct facts):
    - One short intro sentence (mention origin -> destination).
-   - Markdown numbered list (`1.` / `2.` / ...) — at most {max_rows} entries,
-     in the order rows are given. Each line:
+   - Markdown numbered list (`1.` / `2.` / ...) — list EVERY row in
+     `context.rows` (up to {max_rows}; the upstream trim already applied
+     that cap). Do NOT drop rows just to stay short when the user asked
+     for all details / a full list / a time window.
+     Each line, in the order rows are given:
        "**HH:MM → HH:MM** — <qualifiers>"
      Append fare when allowed: " — `LKR <fare>`".
    - Each list item must convey something the previous one didn't.
@@ -460,7 +468,8 @@ ABSOLUTE RULES
   fares, or transport types.
 - No JSON, no Cypher, no markdown fences around the whole response,
   no "as an AI" preambles.
-- Keep it tight — concise is better than complete.
+- When the user asked for all details / every option / a full list, completeness
+  beats brevity — list every row you were given. Otherwise keep it tight.
 """
 
 
@@ -544,6 +553,65 @@ def _dedupe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _flatten_result_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Lift nested Neo4j map projections onto the top-level display fields.
+
+    Cypher returns schedule/fare as map projections, e.g.
+      {origin, destination, schedule_properties: {departure, arrival, ...},
+       fare_properties: {fare, ...}}
+    The formatter / fallback expect flat keys like `departure` and `fare`.
+    Nested values fill gaps only — an explicit top-level key wins.
+    """
+    flat = dict(row)
+    for nest_key in ("schedule_properties", "fare_properties"):
+        nested = row.get(nest_key)
+        if not isinstance(nested, dict):
+            continue
+        for k, v in nested.items():
+            if v in (None, ""):
+                continue
+            if flat.get(k) in (None, ""):
+                flat[k] = v
+    return flat
+
+
+def _wants_full_listing(state: SmartMoveState) -> bool:
+    """True when the user asked for every matching option (not a short sample)."""
+    en = (state.get("user_query") or "").strip().lower()
+    orig = (state.get("user_query_original") or "").strip()
+    text = f"{en} {orig}".strip()
+    if not text:
+        return False
+
+    patterns = (
+        r"\ball\s+(?:the\s+)?(?:details?|options?|schedules?|buses?|trains?|services?|times?|departures?)\b",
+        r"\bevery\s+(?:option|schedule|bus|train|service|time|departure)\b",
+        r"\bfull\s+(?:list|schedule|details?|timetable)\b",
+        r"\blist\s+(?:all|everything)\b",
+        r"\ball\s+available\b",
+        r"සියලුම",
+        r"සියලු",
+        r"මුළුමනින්ම",
+        r"அனைத்து",
+        r"எல்லா",
+    )
+    if any(re.search(p, text, re.IGNORECASE) for p in patterns):
+        return True
+
+    # A closed departure window is already scoped — return every hit in it.
+    dep = _parse_departure_constraint(state.get("departure_time"))
+    return bool(dep and dep.get("op") == "between")
+
+
+def _display_row_limit(state: SmartMoveState) -> int:
+    """How many distinct rows to pass to the formatter / fallback.
+
+    Default stays small for casual asks; jump up when the user wants a full
+    listing or a bounded time window (e.g. 8–9am).
+    """
+    return 80 if _wants_full_listing(state) else 8
+
+
 def _trim_rows_for_prompt(
     rows: list[dict[str, Any]], max_rows: int = 8
 ) -> list[dict[str, Any]]:
@@ -554,23 +622,24 @@ def _trim_rows_for_prompt(
     """
     projected: list[dict[str, Any]] = []
     for row in rows:
-        item = {k: row.get(k) for k in _ROW_FIELDS if row.get(k) not in (None, "")}
+        flat = _flatten_result_row(row)
+        item = {k: flat.get(k) for k in _ROW_FIELDS if flat.get(k) not in (None, "")}
         if item:
             projected.append(item)
     deduped = _dedupe_rows(projected)
+    if max_rows <= 0:
+        return deduped
     return deduped[:max_rows]
 
 
 def _build_preferences(state: SmartMoveState) -> dict[str, Any]:
     """Structured preference snapshot the formatter LLM consumes as part of the RAG prompt."""
-    op, time_24 = _parse_departure_constraint(state.get("departure_time"))
+    departure_constraint = _parse_departure_constraint(state.get("departure_time"))
     fare_intent = _parse_fare_intent(state.get("fare"))
     return {
         "origin": _title_case_place(state.get("origin")) or None,
         "destination": _title_case_place(state.get("destination")) or None,
-        "departure_constraint": (
-            {"op": op, "time": time_24} if op and time_24 else None
-        ),
+        "departure_constraint": departure_constraint,
         "departure_time_raw": state.get("departure_time"),
         "transport_type": state.get("transport_type"),
         "fare_raw": state.get("fare"),
@@ -598,9 +667,10 @@ def response_formatter_node(state: SmartMoveState) -> SmartMoveState:
 
     preferences = _build_preferences(state)
     fare_mode = preferences["fare_intent"].get("mode", "skip")
+    max_rows = _display_row_limit(state)
 
     rows, error = _parse_result_payload(raw_result)
-    trimmed = _trim_rows_for_prompt(rows, max_rows=8)
+    trimmed = _trim_rows_for_prompt(rows, max_rows=max_rows)
 
     schedule_rows: list[dict[str, Any]] = []
     fare_rows: list[dict[str, Any]] = []
@@ -609,8 +679,8 @@ def response_formatter_node(state: SmartMoveState) -> SmartMoveState:
         fare_raw = state.get("result_fare") or ""
         s_rows, _ = _parse_result_payload(sched_raw)
         f_rows, _ = _parse_result_payload(fare_raw)
-        schedule_rows = _trim_rows_for_prompt(s_rows, max_rows=8)
-        fare_rows = _trim_rows_for_prompt(f_rows, max_rows=8)
+        schedule_rows = _trim_rows_for_prompt(s_rows, max_rows=max_rows)
+        fare_rows = _trim_rows_for_prompt(f_rows, max_rows=max_rows)
 
     context_block: dict[str, Any] = {
         "source": result_source,
@@ -619,6 +689,9 @@ def response_formatter_node(state: SmartMoveState) -> SmartMoveState:
         "fare_rows": fare_rows,
         "error": error,
         "fare_reversed": bool(state.get("fare_reversed")),
+        "list_all": max_rows > 8,
+        "total_rows_before_trim": len(rows),
+        "rows_shown": len(trimmed),
     }
 
     prompt = ChatPromptTemplate.from_messages(
@@ -633,7 +706,7 @@ def response_formatter_node(state: SmartMoveState) -> SmartMoveState:
                     "lang_name": lang_name,
                     "lang_code": lang_code,
                     "fare_mode": fare_mode,
-                    "max_rows": 8,
+                    "max_rows": max_rows,
                     "user_query_original": user_query_original,
                     "user_query_english": user_query_english,
                     "preferences_json": json.dumps(

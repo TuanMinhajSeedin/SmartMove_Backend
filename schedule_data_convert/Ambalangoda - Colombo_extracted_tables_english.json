@@ -1,0 +1,238 @@
+{
+  "success": true,
+  "pdf_path": "F:\\MSC\\MSC research from 08-03-2025\\New - 2025-08-11\\ntc_time_schedule\\Raw\\Expressway\\Ambalangoda - Colombo.pdf",
+  "extracted_data": {
+    "tables": [
+      {
+        "table_number": 1,
+        "title": null,
+        "headers": [
+          "Trip Number",
+          "Ambalangoda",
+          "Colombo"
+        ],
+        "rows": [
+          [
+            "Ambalangoda 01",
+            "4:00",
+            "6:00"
+          ],
+          [
+            "Ambalangoda 02",
+            "4:45",
+            "6:45"
+          ],
+          [
+            "Ambalangoda 03",
+            "5:30",
+            "7:30"
+          ],
+          [
+            "Ambalangoda 04",
+            "6:00",
+            "8:00"
+          ],
+          [
+            "Ambalangoda 05",
+            "6:45",
+            "8:45"
+          ],
+          [
+            "Ambalangoda 06",
+            "7:30",
+            "9:30"
+          ],
+          [
+            "Ambalangoda 07",
+            "8:15",
+            "10:15"
+          ],
+          [
+            "Ambalangoda 08",
+            "9:00",
+            "11:00"
+          ],
+          [
+            "Ambalangoda 09",
+            "9:45",
+            "11:45"
+          ],
+          [
+            "Ambalangoda 01",
+            "10:30",
+            "12:30"
+          ],
+          [
+            "Ambalangoda 02",
+            "11:15",
+            "13:15"
+          ],
+          [
+            "Ambalangoda 03",
+            "12:00",
+            "14:00"
+          ],
+          [
+            "Ambalangoda 04",
+            "12:45",
+            "14:45"
+          ],
+          [
+            "Ambalangoda 05",
+            "13:30",
+            "15:30"
+          ],
+          [
+            "Ambalangoda 06",
+            "14:15",
+            "16:15"
+          ],
+          [
+            "Ambalangoda 07",
+            "15:00",
+            "17:00"
+          ],
+          [
+            "Ambalangoda 08",
+            "16:00",
+            "18:00"
+          ],
+          [
+            "Ambalangoda 09",
+            "17:00",
+            "19:00"
+          ]
+        ],
+        "page_number": 1,
+        "notes": null
+      },
+      {
+        "table_number": 2,
+        "title": null,
+        "headers": [
+          "Trip Number",
+          "Colombo",
+          "Makumbura",
+          "Ambalangoda"
+        ],
+        "rows": [
+          [
+            "Ambalangoda 01",
+            "7:00",
+            "8:00",
+            "9:00"
+          ],
+          [
+            "Ambalangoda 02",
+            "8:00",
+            "9:00",
+            "10:00"
+          ],
+          [
+            "Ambalangoda 03",
+            "8:20",
+            "9:20",
+            "10:20"
+          ],
+          [
+            "Ambalangoda 04",
+            "9:00",
+            "10:00",
+            "11:00"
+          ],
+          [
+            "Ambalangoda 05",
+            "9:40",
+            "10:40",
+            "11:40"
+          ],
+          [
+            "Ambalangoda 06",
+            "10:20",
+            "11:20",
+            "12:20"
+          ],
+          [
+            "Ambalangoda 07",
+            "11:00",
+            "12:00",
+            "13:00"
+          ],
+          [
+            "Ambalangoda 08",
+            "12:00",
+            "13:00",
+            "14:00"
+          ],
+          [
+            "Ambalangoda 09",
+            "13:00",
+            "14:00",
+            "15:00"
+          ],
+          [
+            "Ambalangoda 01",
+            "13:40",
+            "14:40",
+            "15:40"
+          ],
+          [
+            "Ambalangoda 02",
+            "14:20",
+            "15:20",
+            "16:20"
+          ],
+          [
+            "Ambalangoda 03",
+            "15:00",
+            "16:00",
+            "17:00"
+          ],
+          [
+            "Ambalangoda 04",
+            "15:40",
+            "16:40",
+            "17:40"
+          ],
+          [
+            "Ambalangoda 05",
+            "16:20",
+            "17:20",
+            "18:20"
+          ],
+          [
+            "Ambalangoda 06",
+            "17:00",
+            "18:00",
+            "19:00"
+          ],
+          [
+            "Ambalangoda 07",
+            "18:00",
+            "19:00",
+            "20:00"
+          ],
+          [
+            "Ambalangoda 08",
+            "19:30",
+            "20:30",
+            "21:30"
+          ],
+          [
+            "Ambalangoda 09",
+            "20:30",
+            "21:30",
+            "22:30"
+          ]
+        ],
+        "page_number": 1,
+        "notes": null
+      }
+    ],
+    "summary": "This document contains two tables. The first table shows the departure times from Ambalangoda to Colombo. The second table shows the departure times from Colombo to Ambalangoda."
+  },
+  "timestamp": "2025-10-18T21:57:56.136938",
+  "model_used": "gemini-2.0-flash-exp",
+  "translated": true,
+  "translation_method": "gemini-2.5-flash"
+}
